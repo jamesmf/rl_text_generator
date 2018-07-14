@@ -14,7 +14,8 @@ from keras.layers import Input, Dense, Conv1D, Embedding, Flatten, GlobalMaxPool
 from keras.layers import MaxPooling1D, Add, Dropout, BatchNormalization, Concatenate
 from keras.optimizers import Adam
 from keras.models import Model, load_model
-
+from gym.utils import seeding
+from gym import spaces
 
 DLM = "$$$$"
 
@@ -137,6 +138,14 @@ class Environment:
         self.warmup = warmup
         self.freshly_generated = []
         self.seed_regex = re.compile("name:\n.{4,60}\n")
+        max_char = np.max(self.agent.text_processor.char_dict.values())
+        low = np.zeros((self.agent.max_len,))
+        high = np.ones((self.agent.max_len,))*max_char
+
+        # gym api for keras-rl
+        self.action_space = spaces.Discrete(self.agent.num_actions)
+        self.observation_space = spaces.Box(low=low, high=high)
+        self.reset()
 
     def update(self, **kwargs):
         for evaluator in self.evaluators:
@@ -189,7 +198,6 @@ class Environment:
         if self.episode_done:
             self.freshly_generated.append(self.state_text)
 
-
     def backspace(self):
         if len(self.state_text) > len(self.seed_text):
             self.state_text = self.state_text[:-1]
@@ -239,6 +247,27 @@ class Environment:
                 self.take_action(action)
         self.episode_counter = episode_count
 
+    def step(self, action):
+        """
+        Implement the gym api
+        """
+        self.take_action(action)
+        self.evaluate()
+        return self.state_vec, self.reward, self.episode_done, {}
+
+    def reset(self):
+        self.new_episode()
+        return self.state_vec
+
+    def seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+    def close(self):
+        pass
+
+    def render(self):
+        print(self.state_text)
 
 class Policy:
     """
