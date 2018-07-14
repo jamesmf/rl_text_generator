@@ -5,10 +5,52 @@ import numpy as np
 from keras.preprocessing.sequence import pad_sequences
 from keras.callbacks import EarlyStopping, TensorBoard, ModelCheckpoint
 from keras.layers import Input, Dense, Conv1D, Embedding, Flatten, GlobalMaxPooling1D
-from keras.layers import MaxPooling1D, Add, Dropout, BatchNormalization, Multiply
+from keras.layers import MaxPooling1D, Dropout, BatchNormalization, Multiply
+from keras.layers import Lambda, Layer
 from keras.optimizers import Adam
 from keras.models import Model, load_model
+import keras.backend as K
 
+
+"""
+This section directly from keras-rl
+"""
+def huber_loss(y_true, y_pred, clip_value):
+    # Huber loss, see https://en.wikipedia.org/wiki/Huber_loss and
+    # https://medium.com/@karpathy/yes-you-should-understand-backprop-e2f06eab496b
+    # for details.
+    assert clip_value > 0.
+
+    x = y_true - y_pred
+    if np.isinf(clip_value):
+        return .5 * K.square(x)
+
+    condition = K.abs(x) < clip_value
+    squared_loss = .5 * K.square(x)
+    linear_loss = clip_value * (K.abs(x) - .5 * clip_value)
+    if K.backend() == 'tensorflow':
+        import tensorflow as tf
+        if hasattr(tf, 'select'):
+            return tf.select(condition, squared_loss, linear_loss)  # condition, true, false
+        else:
+            return tf.where(condition, squared_loss, linear_loss)  # condition, true, false
+    elif K.backend() == 'theano':
+        from theano import tensor as T
+        return T.switch(condition, squared_loss, linear_loss)
+    else:
+        raise RuntimeError('Unknown backend "{}".'.format(K.backend()))
+
+
+def clipped_masked_error(args):
+    y_true, y_pred, mask = args
+    # this line edited from keras-rl, should pass in delta_clip from self
+    loss = huber_loss(y_true, y_pred, np.inf)
+    loss *= mask  # apply element-wise mask
+    return K.sum(loss, axis=-1)
+
+
+def mean_q(y_true, y_pred):
+    return K.mean(K.max(y_pred, axis=-1))
 
 class TextDQNAgent:
     """
@@ -21,8 +63,8 @@ class TextDQNAgent:
     model_dir = "../models/dqns/"
 
     def __init__(self, policy, text_processor, max_state_len,
-                 model_path=None, gamma=0.95, epsilon=0.1,
-                 update_interval=30, **kwargs):
+                 model_path=None, gamma=0.5, epsilon=0.1,
+                 update_interval=50, **kwargs):
         self.policy = policy
         self.text_processor = text_processor
         self.actions = [k for k in text_processor.char_dict.keys()]
@@ -45,9 +87,7 @@ class TextDQNAgent:
         filter_size = kwargs.get("filter_size", 64)
         embedding_size = kwargs.get("embedding_size", 16)
         num_blocks = kwargs.get("num_blocks", 2)
-        categorical = kwargs.get("categorical", False)
         char_inp = Input(shape=(self.max_len,))
-        mask = Input(shape=(len(self.actions),))
         emb = Embedding(len(tp.char_dict), embedding_size)(char_inp)
         layer_in = emb
         for n in range(0, num_blocks):
@@ -71,21 +111,27 @@ class TextDQNAgent:
             pool = MaxPooling1D(pool_size=5)(conv4)
             layer_in = pool
         flat = Flatten()(conv4)
-        if categorical:
-            out = Dense(len(self.actions), activation='softmax',
-                        name='predicted_q')(flat)
-        else:
-            out = Dense(len(self.actions), activation='relu',
-                        name='predicted_q')(flat)
-        # this layer masks the output so that we only get gradient from (a)
-        m = Multiply()([mask, out])
-        model = Model([char_inp, mask], m)
+        out = Dense(len(self.actions),
+                    name='predicted_q')(flat)
+        m = Model(char_inp, out)
+        m.compile('sgd', 'mse')
+
+        y_pred = m.output
+        y_true = Input(name='y_true', shape=(self.num_actions,))
+        mask = Input(name='mask', shape=(self.num_actions,))
+        loss_out = Lambda(clipped_masked_error, output_shape=(1,), name='loss')([y_true, y_pred, mask])
+        ins = [m.input] if type(m.input) is not list else m.input
+        trainable_model = Model(inputs=ins + [y_true, mask], outputs=[loss_out, y_pred])
+        assert len(trainable_model.output_names) == 2
+        combined_metrics = {trainable_model.output_names[1]: [mean_q]}
+        losses = [
+            lambda y_true, y_pred: y_pred,  # loss is computed in Lambda layer
+            lambda y_true, y_pred: K.zeros_like(y_pred),  # we only include this for the metrics
+        ]
         opt = Adam(0.001)
-        if categorical:
-            model.compile(opt, 'categorical_crossentropy')
-        else:
-            model.compile(opt, 'mse')
-        return model
+        trainable_model.compile(optimizer=opt, loss=losses,
+                                metrics=combined_metrics)
+        return trainable_model
 
     def greedy_init(self, env, model, log_id, epochs=1):
         num_per = 10
@@ -155,7 +201,7 @@ class TextDQNAgent:
             tp = self.text_processor
             env.state_vec = tp.vectorize(env.state_text, seq_len=self.max_len)
         mask = np.ones((1, self.num_actions))
-        q_vals = self.model.predict([env.state_vec, mask])[0]
+        q_vals = self.model.predict([env.state_vec, mask, mask])[1][0]
         action_ind = np.argmax(q_vals)
         action = self.text_processor.char_rev[action_ind]
         return action, action_ind
@@ -179,16 +225,18 @@ class TextDQNAgent:
             terminal1_batch.append(0. if e.terminal1 else 1.)
         
         state0_batch = np.array(state0_batch)
+        ones_mask = np.ones((state0_batch.shape[0], self.num_actions))
         state1_batch = [np.array(state1_batch),
-                        np.ones((state0_batch.shape[0], self.num_actions))]
+                        ones_mask, ones_mask]
         terminal1_batch = np.array(terminal1_batch)
         reward_batch = np.array(reward_batch)
-        q_values = self.model.predict_on_batch(state1_batch)
+        q_values = self.model.predict_on_batch(state1_batch)[1]
         chosen_actions = np.argmax(q_values, axis=1)
-        target_qs = self.target_model.predict_on_batch(state1_batch)
+        target_qs = self.target_model.predict_on_batch(state1_batch)[1]
         q_batch = target_qs[range(0, batch_size), chosen_actions]
         
         targets = np.zeros((batch_size, self.num_actions))
+        dummy_targets = np.zeros((batch_size,))
         masks = np.zeros((batch_size, self.num_actions))
         discounted_reward_batch = self.gamma * q_batch
         discounted_reward_batch *= terminal1_batch
@@ -196,6 +244,7 @@ class TextDQNAgent:
         for idx, (target, mask, R, action_txt) in enumerate(zip(targets, masks, Rs, action_batch)):
             action = env.text_processor.char_dict[action_txt]
             target[action] = R
+            dummy_targets[idx] = R
             mask[action] = 1.
         #print(state0_batch)
         #print(masks)
@@ -207,7 +256,10 @@ class TextDQNAgent:
         self.disc_rew_batch = discounted_reward_batch
         self.Rs = Rs
         self.targets = targets
-        val = self.model.train_on_batch([state0_batch, masks], targets)
+        self.masks = masks
+        self.dummy_targets = dummy_targets
+        val = self.model.train_on_batch([state0_batch, targets, masks],
+                                        [dummy_targets, targets])
         #print("training loss: {}".format(val))
         return val
 

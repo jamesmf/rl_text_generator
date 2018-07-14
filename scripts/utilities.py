@@ -2,6 +2,7 @@ import re
 import os
 import random
 import json
+import pickle
 from collections import namedtuple
 import numpy as np
 from sklearn.decomposition import LatentDirichletAllocation
@@ -277,14 +278,14 @@ class Discriminator():
         state = env.state_text
         if done and self.reward_only_on_end:
             state_vec = self.processor.vectorize(state, seq_len=self.max_len)
-            r = self.model.predict(state_vec.reshape(1, -1))[0][0]
+            r = self.model.predict(state_vec.reshape(1, -1))[0][0] - 0.5
 #            print("global reward: {}".format(r))
             return r * self.reward_norm
         elif not self.reward_only_on_end:
             state_vec = self.processor.vectorize(state, seq_len=self.max_len)
             cr = self.processor.char_rev
 #            print(''.join([cr[i] for i in state_vec]))
-            r = self.model.predict(state_vec.reshape(1, -1))[0][0]
+            r = self.model.predict(state_vec.reshape(1, -1))[0][0] - 0.5
 #            print("local reward: {}".format(r))
             return r * self.reward_norm
         return 0
@@ -294,10 +295,11 @@ class Discriminator():
         Define or load a model
         """
         if path:
+            print("loading from {}".format(path))
             self.model = load_model(path)
             self.max_len = self.model.input_shape[1]
-            with open(path+'_map.json', 'r'):
-                self.processor.char_dict = json.load(path)
+            with open(path+'_map.json', 'r') as f:
+                self.processor.char_dict = json.load(f)
             self.processor.char_rev = {v: k for k,v in self.processor.char_dict.items()}
         else:
             tp = self.processor
@@ -409,6 +411,7 @@ class Discriminator():
 
 
 class KLCalculator:
+    storage_dir = "../models/discriminators/"
 
     def __init__(self, name, reward_only_on_end, cv_args={},
                  lda_args={'n_components': 30}, max_reward=2):
@@ -417,23 +420,37 @@ class KLCalculator:
         self.cv = CountVectorizer(**cv_args)
         self.model = LatentDirichletAllocation(**lda_args)
         self.max_reward = max_reward
+        if reward_only_on_end:
+            self.reward_norm = 1./self.max_reward
+        else:
+            self.reward_norm = 2/600./self.max_reward
 
     def fit(self, env):
         docs = env.real_docs_train
         x = self.cv.fit_transform(docs)
         self.model.fit(x)
+        with open(self.storage_dir+self.name, 'wb') as f:
+            pickle.dump(self, f)
 
     def evaluate(self, env):
-        odoc = [env.original_doc]
-        ndoc = [env.state_text]
-        x0 = self.model.transform(self.cv.transform(odoc))[0]+1e-8
-        x1 = self.model.transform(self.cv.transform(ndoc))[0]+1e-8
-        kldiv = entropy(x0, x1)
-        reward = max(self.max_reward - kldiv, 0)
-        return reward*2. / env.max_steps
+        if env.episode_done or (not self.reward_only_on_end):
+            odoc = [env.original_doc]
+            ndoc = [env.state_text]
+            x0 = self.model.transform(self.cv.transform(odoc))[0]+1e-8
+            x1 = self.model.transform(self.cv.transform(ndoc))[0]+1e-8
+            kldiv = entropy(x0, x1)
+            reward = max(self.max_reward - kldiv, 0)
+            return reward*self.reward_norm
+        return 0.
 
     def update(self, env):
         pass
+
+    def get_model(self, model_path):
+        with open(model_path, 'rb') as f:
+            obj = pickle.load(f)
+        self.model = obj.model
+        self.cv = obj.cv
         
 
 Experience = namedtuple('Experience', 
