@@ -1,14 +1,8 @@
 import re
 import os
+import sys
 import random
-import json
-import pickle
-from collections import namedtuple
 import numpy as np
-from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.feature_extraction.text import CountVectorizer
-from scipy.stats import entropy
-from keras.preprocessing.sequence import pad_sequences
 from gym.utils import seeding
 from gym import spaces
 
@@ -166,5 +160,9 @@ class Environment:
     def close(self):
         pass
 
-    def render(self):
-        print(self.state_text)
+    def render(self, mode='human'):
+        if not self.episode_done:
+            sys.stdout.write('\r'+self.state_text+"\treward {}".format(self.episode_reward))
+            sys.stdout.flush()
+        else:
+            print(self.state_text+"\treward {}".format(self.episode_reward))

@@ -53,7 +53,7 @@ class Discriminator():
         state = env.state_text
         if done and self.reward_only_on_end:
             state_vec = self.vectorize(state)
-            r = self.model.predict(state_vec.reshape(1, -1))[0][0]
+            r = self.model.predict(state_vec.reshape(1, -1))[0][0] - 0.5
 #            print("global reward: {}".format(r))
             return r * self.reward_norm
         elif not self.reward_only_on_end:
@@ -143,7 +143,7 @@ class Discriminator():
                 else:
                     end_ind = np.random.randint(0, len(doc))
                     start_ind = max(0, end_ind-self.max_len)
-                x = self.vectorize(doc, self.max_len,start=start_ind,
+                x = self.vectorize(doc, start=start_ind,
                                    end=end_ind)
                 X_train[n2, :] = x
                 y_train[n2] = train_labels[n]
@@ -160,8 +160,7 @@ class Discriminator():
                 else:
                     end_ind = np.random.randint(0, len(doc))
                     start_ind = max(0, end_ind-self.max_len)
-                x = self.vectorize(doc, self.max_len,
-                                   start=start_ind, end=end_ind)
+                x = self.vectorize(doc, start=start_ind, end=end_ind)
                 X_val[n2, :] = x
                 y_val[n2] = val_labels[n]
         callbacks = [

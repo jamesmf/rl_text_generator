@@ -39,5 +39,5 @@ class TextProcessor(Processor):
         """
         batch = np.array(batch)
         if len(batch.shape) == 3:
-            batch = batch[0]
+            batch = batch.reshape(batch.shape[0], batch.shape[2])
         return batch
